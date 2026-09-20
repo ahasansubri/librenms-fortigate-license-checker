@@ -139,7 +139,6 @@ address, API token, serial number, subscriptions, and configuration file.
 - [Multiple FortiGates and HA](docs/MULTIPLE_FIREWALLS.md)
 - [Operations](docs/OPERATIONS.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [Publishing to GitHub](docs/PUBLISHING.md)
 - [Security policy](SECURITY.md)
 
 Official background documentation:
