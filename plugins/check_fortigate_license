@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Nagios-compatible FortiGate licence status check for LibreNMS."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
+
+DEFAULT_ENDPOINTS = (
+    "/api/v2/monitor/license/status/select/",
+    "/api/v2/monitor/license/status",
+)
+NEVER_VALUES = {"never", "never expires", "perpetual", "unlimited", "n/a"}
+DEFAULT_CRITICAL_STATUS_PATTERNS = ("*expired*", "*invalid*", "*revoked*")
+DEFAULT_WARNING_STATUS_PATTERNS = ("*warning*", "*expiring*")
+
+
+@dataclass(frozen=True)
+class Licence:
+    name: str
+    status: str
+    expires: date | None
+    last_update: datetime | None = None
+
+    @property
+    def days_remaining(self) -> int | None:
+        if self.expires is None:
+            return None
+        return (self.expires - date.today()).days
+
+
+def finish(code: int, message: str) -> None:
+    labels = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+    print(f"FORTIGATE LICENCE {labels[code]} - {message}")
+    raise SystemExit(code)
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"configuration file not found: {path}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read configuration file {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("configuration root must be a JSON object")
+    if not isinstance(data.get("api_token"), str) or not data["api_token"].strip():
+        raise RuntimeError("api_token is missing from the configuration")
+    return data
+
+
+def build_ssl_context(config: dict[str, Any], insecure: bool) -> ssl.SSLContext:
+    if insecure or config.get("verify_tls") is False:
+        return ssl._create_unverified_context()
+    ca_file = config.get("ca_file")
+    if ca_file:
+        return ssl.create_default_context(cafile=str(ca_file))
+    return ssl.create_default_context()
+
+
+def endpoint_list(config: dict[str, Any]) -> tuple[str, ...]:
+    configured = config.get("endpoint")
+    if configured:
+        endpoint = str(configured).strip()
+        if not endpoint.startswith("/"):
+            endpoint = "/" + endpoint
+        return (endpoint,)
+    return DEFAULT_ENDPOINTS
+
+
+def query_firewall(host: str, config: dict[str, Any], insecure: bool) -> dict[str, Any]:
+    timeout = int(config.get("timeout", 20))
+    port = int(config.get("port", 443))
+    vdom = str(config.get("vdom", "root"))
+    context = build_ssl_context(config, insecure)
+    last_404: urllib.error.HTTPError | None = None
+
+    for endpoint in endpoint_list(config):
+        query = urllib.parse.urlencode({"vdom": vdom})
+        url = f"https://{host}:{port}{endpoint}?{query}"
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {config['api_token'].strip()}",
+                "User-Agent": "LibreNMS-FortiGate-Licence-Check/1.0.1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            if not isinstance(payload, dict):
+                raise RuntimeError("FortiGate API returned an unexpected JSON document")
+            return payload
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404 and len(endpoint_list(config)) > 1:
+                last_404 = exc
+                continue
+            raise RuntimeError(f"FortiGate API returned HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"cannot contact FortiGate API: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError("FortiGate API request timed out") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("FortiGate API returned invalid JSON") from exc
+
+    if last_404 is not None:
+        raise RuntimeError("FortiGate licence API endpoint was not found")
+    raise RuntimeError("FortiGate licence API request failed")
+
+
+def parse_epoch_or_date(value: Any) -> date | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and value.strip().lower() in NEVER_VALUES:
+        return None
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = None
+
+    if numeric is not None:
+        if numeric <= 0:
+            return None
+        if numeric > 10_000_000_000:
+            numeric /= 1000
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc).date()
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError(f"invalid licence expiry timestamp: {value}") from exc
+
+    text = str(value).strip()
+    for pattern in ("%Y-%m-%d", "%Y/%m/%d", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(text, pattern).date()
+        except ValueError:
+            continue
+    raise ValueError(f"unsupported licence expiry date: {value}")
+
+
+def parse_last_update(value: Any) -> datetime | None:
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        numeric = float(value)
+        if numeric > 10_000_000_000:
+            numeric /= 1000
+        return datetime.fromtimestamp(numeric, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def ignored(name: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(name.lower(), pattern.lower()) for pattern in patterns)
+
+
+def add_licence(entries: list[Licence], name: str, value: Any, ignore_patterns: list[str]) -> None:
+    if not isinstance(value, dict) or "status" not in value or ignored(name, ignore_patterns):
+        return
+    entries.append(
+        Licence(
+            name=name,
+            status=str(value.get("status", "unknown")).strip() or "unknown",
+            expires=parse_epoch_or_date(value.get("expires")),
+            last_update=parse_last_update(value.get("last_update")),
+        )
+    )
+
+
+def parse_licences(payload: dict[str, Any], ignore_patterns: list[str]) -> list[Licence]:
+    api_status = str(payload.get("status", "success")).lower()
+    if api_status not in {"success", "ok"}:
+        raise RuntimeError(f"FortiGate API reported status {api_status}")
+
+    results = payload.get("results")
+    if not isinstance(results, dict):
+        raise RuntimeError("FortiGate API response did not contain licence results")
+
+    entries: list[Licence] = []
+    for name, value in results.items():
+        if not isinstance(value, dict):
+            continue
+        support = value.get("support")
+        if isinstance(support, dict):
+            for support_name, support_value in support.items():
+                add_licence(
+                    entries,
+                    f"{name} / {support_name}",
+                    support_value,
+                    ignore_patterns,
+                )
+        else:
+            add_licence(entries, str(name), value, ignore_patterns)
+    return entries
+
+
+def matches_status(status: str, patterns: tuple[str, ...] | list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(status.lower(), pattern.lower()) for pattern in patterns)
+
+
+def item_severity(
+    item: Licence,
+    warning_days: int,
+    critical_days: int,
+    critical_statuses: list[str],
+    warning_statuses: list[str],
+) -> int:
+    if matches_status(item.status, critical_statuses):
+        return CRITICAL
+    days = item.days_remaining
+    if days is not None and days <= critical_days:
+        return CRITICAL
+    if matches_status(item.status, warning_statuses):
+        return WARNING
+    if days is not None and days <= warning_days:
+        return WARNING
+    return OK
+
+
+def item_text(item: Licence) -> str:
+    status = item.status
+    days = item.days_remaining
+    if item.expires is None or days is None:
+        return f"{item.name}: {status}"
+    expiry = item.expires.strftime("%d %b %Y")
+    if days < 0:
+        timing = f"expired {abs(days)} day(s) ago"
+    elif days == 0:
+        timing = "expires today"
+    else:
+        timing = f"{days} day(s) remaining"
+    return f"{item.name}: {status}, {timing} ({expiry})"
+
+
+def evaluate(
+    licences: list[Licence],
+    warning_days: int,
+    critical_days: int,
+    critical_statuses: list[str],
+    warning_statuses: list[str],
+) -> tuple[int, str]:
+    ranked = sorted(
+        licences,
+        key=lambda item: (
+            -item_severity(item, warning_days, critical_days, critical_statuses, warning_statuses),
+            item.days_remaining if item.days_remaining is not None else 10**9,
+            item.name.lower(),
+        ),
+    )
+    overall = max(
+        item_severity(item, warning_days, critical_days, critical_statuses, warning_statuses)
+        for item in licences
+    )
+    return overall, "; ".join(item_text(item) for item in ranked)
+
+
+def string_list(config: dict[str, Any], key: str, default: tuple[str, ...] = ()) -> list[str]:
+    value = config.get(key, list(default))
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise RuntimeError(f"{key} must be a JSON array of strings")
+    return value
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("host", nargs="?", help="FortiGate management IP or hostname")
+    parser.add_argument("-H", "--hostname", dest="host_option", help="FortiGate management IP or hostname")
+    parser.add_argument("--config", help="JSON configuration file")
+    parser.add_argument("-w", "--warning", type=int, default=60, help="warning threshold in days")
+    parser.add_argument("-c", "--critical", type=int, default=30, help="critical threshold in days")
+    parser.add_argument("--insecure", action="store_true", help="disable TLS certificate validation")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    host = args.host_option or args.host
+    if not host:
+        finish(UNKNOWN, "firewall host was not provided")
+    if args.warning < 0 or args.critical < 0 or args.critical > args.warning:
+        finish(UNKNOWN, "thresholds must satisfy 0 <= critical <= warning")
+
+    config_path = Path(args.config or f"/etc/librenms/fortigate-license/{host}.json")
+    try:
+        config = load_config(config_path)
+        api_host = str(config.get("host") or host)
+        ignore_patterns = string_list(config, "ignore_features")
+        critical_statuses = string_list(
+            config, "critical_status_patterns", DEFAULT_CRITICAL_STATUS_PATTERNS
+        )
+        warning_statuses = string_list(
+            config, "warning_status_patterns", DEFAULT_WARNING_STATUS_PATTERNS
+        )
+        licences = parse_licences(
+            query_firewall(api_host, config, args.insecure),
+            ignore_patterns,
+        )
+        if not licences:
+            finish(UNKNOWN, "no parseable licence entries were returned")
+        status, message = evaluate(
+            licences,
+            args.warning,
+            args.critical,
+            critical_statuses,
+            warning_statuses,
+        )
+        finish(status, message)
+    except (RuntimeError, ValueError, OSError) as exc:
+        finish(UNKNOWN, str(exc))
+
+
+if __name__ == "__main__":
+    main()

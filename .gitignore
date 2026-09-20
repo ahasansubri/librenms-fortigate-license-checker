@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.log
+*.pcap
+*.tar.gz
+*.zip
+.coverage
+.pytest_cache/
+.idea/
+.vscode/
+
+# Never commit live credentials or per-device configurations.
+config/
+secrets/
+*.key
+*.pem
+*.p12
+

@@ -1,0 +1,12 @@
+{
+  "host": "192.0.2.10",
+  "port": 443,
+  "api_token": "PASTE_THE_RESTRICTED_API_TOKEN_HERE",
+  "vdom": "root",
+  "verify_tls": false,
+  "ca_file": "",
+  "timeout": 20,
+  "ignore_features": [],
+  "critical_status_patterns": ["*expired*", "*invalid*", "*revoked*"],
+  "warning_status_patterns": ["*warning*", "*expiring*"]
+}
